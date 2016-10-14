@@ -15,7 +15,7 @@ import psutil
 import tornado
 import websocket
 from decorator import decorator
-from funcserver import RPCServer, RPCClient
+from funcserver import Server, Client
 
 # As we are using gevent for IO parallelization (network RPC requests) and
 # gevent does not play well with process spawning, we need to make sure
@@ -395,7 +395,7 @@ class VWAPI(object):
 
         sys.exit(0)
 
-class VWClient(RPCClient):
+class VWClient(Client):
     pass
 
 class WSVWHandler(tornado.websocket.WebSocketHandler):
@@ -414,7 +414,7 @@ class WSVWHandler(tornado.websocket.WebSocketHandler):
     def on_close(self):
         pass
 
-class VWServer(RPCServer):
+class VWServer(Server):
     NAME = 'VWServer'
     DESC = 'Vowpal Wabbit Server'
 
@@ -440,4 +440,4 @@ class VWServer(RPCServer):
             help='Absolute path of vw executable file')
 
 if __name__ == '__main__':
-    VWServer().start()
+    VWServer()

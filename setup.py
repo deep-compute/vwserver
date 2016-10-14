@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="vwserver",
-    version='0.1',
+    version='0.1.1',
     description="Vowpal Wabbit Server",
     keywords='vwserver',
     author='Prashanth Ellina',
@@ -18,7 +18,7 @@ setup(
         'funcserver',
     ],
     dependency_links=[
-        'http://github.com/prashanthellina/funcserver/tarball/master#egg=funcserver'
+        'http://github.com/deep-compute/funcserver/tarball/master#egg=funcserver'
     ],
     package_dir={'vwserver': 'vwserver'},
     packages=find_packages('.'),
