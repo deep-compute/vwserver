@@ -428,12 +428,14 @@ class VWServer(Server):
             os.makedirs(self.data_dir)
 
     def prepare_api(self):
+        super(VWServer, self).prepare_api()
         return VWAPI(self.data_dir, self.vw_binary)
 
     def prepare_handlers(self):
         return [('/ws/vw/([^/]+)', WSVWHandler)]
 
     def define_args(self, parser):
+        super(VWServer, self).define_args(parser)
         parser.add_argument('data_dir', type=str, metavar='data-dir',
             help='Directory path where data is stored')
         parser.add_argument('vw_binary', type=str, metavar='vw-binary',
