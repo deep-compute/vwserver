@@ -1,5 +1,3 @@
-from gevent import monkey; monkey.patch_all()
-
 import os
 import sys
 import time
@@ -17,46 +15,23 @@ import websocket
 from decorator import decorator
 from funcserver import Server, Client
 
-# As we are using gevent for IO parallelization (network RPC requests) and
-# gevent does not play well with process spawning, we need to make sure
-# that the process spawned is a daemon otherwise the event loop gets stuck
-# Vowpal wabbit does support daemonizing however that isn't working in
-# active learning mode as of version 7.7. To overcome this we are using
-# a Vowpal wabbit wrapping python script that daemonizes and execs into
-# the Vowpal wabbit binary
-VWWRAPPER = os.path.join(os.path.dirname(__file__), 'vwdaemon.py')
+# These options cannot be removed by the user because
+# they are required by the vwserver to properly interact
+# with the vw process
+VW_MUST_OPTIONS = set([
+    'no_stdin',
+    'save_resume',
+    'quiet',
+    'port',
+])
 
-VWOPTIONS = {
+# Default options that will be passed to the vw process
+# The user can override these during the creation of a
+# new model
+VW_DEFAULT_OPTIONS = {
     'passes': 3,
     'bit_precision': 27,
-    'active_learning': False,
-    'active_mellowness': 8,
 }
-
-def get_vwdaemon_pid(port):
-    '''
-    Finds the vwwrapper daemon process that is listening on @port
-    and returns pid of that process
-    '''
-    for pid in psutil.pids():
-        try:
-            p = psutil.Process(pid)
-            conns = p.connections()
-        except psutil.AccessDenied:
-            continue
-        conns = [c.laddr for c in conns if c.status == 'LISTEN']
-        ports = [_port for _, _port in conns]
-        if port in ports and p.parent().pid == 1:
-            return pid
-
-    return None
-
-def is_process_running(process_id):
-    try:
-        os.kill(process_id, 0)
-        return True
-    except OSError:
-        return False
 
 def get_free_port():
     '''
@@ -78,11 +53,14 @@ def sleep_until(fn, timeout=25.0):
     telapsed = 0
 
     for t in (.1, .2, .4, .8, 1.6, 3.2, 6.4, 12.8):
-        if not fn(): time.sleep(t)
-        telapsed += t
-        if telapsed > timeout: break
+        if fn():
+            return True
 
-    return fn()
+        time.sleep(t)
+
+        telapsed += t
+        if telapsed > timeout:
+            return False
 
 class VWSocket(object):
     CHUNK_SIZE = 4096
@@ -116,11 +94,14 @@ class VWSocket(object):
 
     def connect(self):
         try:
+            self.log.debug('Connecting to vw', port=self.port)
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect(('localhost', self.port))
+            self.log.debug('Connected')
             if self.on_connect: self.on_connect()
             return True
         except socket.error:
+            self.log.debug('Connection failed')
             return False
 
     def reconnect(self):
@@ -131,6 +112,7 @@ class VWSocket(object):
         return True
 
     def close(self):
+        self.log.debug('Closing socket')
         self.sock.close()
 
     def send_commands(self, commands, num_responses=None):
@@ -139,19 +121,22 @@ class VWSocket(object):
         with self.lock:
             try:
                 msg = '\n'.join(commands) + '\n'
+                self.log.debug('Sending commands to vw', commands=msg)
+
                 self.sock.sendall(msg)
 
                 if num_responses:
-                    return list(self._recvlines(len(commands)))
+                    resp = list(self._recvlines(len(commands)))
+                    self.log.debug('Received responses from vw', responses=resp)
+                    return resp
             except socket.error:
                 self.reconnect()
                 raise
 
 class VW(object):
-    NUM_CHILD_PROCESSES = 8
 
     def __init__(self, name, data_dir, vw_binary, log, options=None, on_fatal_failure=None):
-        self.log = log
+        self.log = log.bind(vw_model_name=name)
         self.name = name
         self.data_dir = data_dir
         self.vw_binary = vw_binary
@@ -161,14 +146,13 @@ class VW(object):
 
         self.options_fpath = os.path.join(data_dir, 'options')
         self.model_fpath = os.path.join(data_dir, 'model')
-        self.pid_fpath = os.path.join(data_dir, 'pid')
         self.cache_fpath = os.path.join(data_dir, 'cache')
         self.dummy_input_fpath = os.path.join(data_dir, 'dummy')
 
         self.options = options or self.load_options()
         self.last_used = time.time()
 
-        self.kill_vw_processes()
+        self.vw_process = None
         self.load_vw()
 
     @classmethod
@@ -179,22 +163,20 @@ class VW(object):
     def exists(cls, name, data_dir):
         return os.path.exists(data_dir)
 
-    def kill_vw_processes(self):
-        if os.path.exists(self.pid_fpath):
-            pid = int(open(self.pid_fpath).read())
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except OSError:
-                pass
-            os.remove(self.pid_fpath)
-            return pid
+    def kill_vw_process(self):
+        # do nothing if there is no process running
+        if not self.vw_process or self.vw_process.poll() is not None:
+            return
+
+        self.vw_process.terminate()
+        self.vw_process = None
 
     def make_options(self):
         o = []
         for k, v in self.options.iteritems():
             # boolean value: active=True becomes --active
             if isinstance(v, bool):
-                if v is True:
+                if v:
                     o.append('--%s' % k)
 
             elif isinstance(v, str):
@@ -218,6 +200,9 @@ class VW(object):
         # user-specifiable options
         opts = self.make_options()
 
+        # save options to file so we can reload correctly upon restart
+        self.save_options()
+
         # model file option
         if os.path.exists(self.model_fpath):
             opts.append('--initial_regressor %s' % self.model_fpath)
@@ -228,36 +213,30 @@ class VW(object):
         # NOTE: disabling cache because it is causing issues
         # with online training
         opts.extend(['--no_stdin', '--save_resume', '--quiet',
-                    '--num_children %s' % self.NUM_CHILD_PROCESSES,
                     #'--cache_file %s' % self.cache_fpath,
                     '--port %s' % self.port])
 
         # construct vw command
-        cmd = '%s %s %s %s %s %s' % (sys.executable, VWWRAPPER, self.pid_fpath,
-            self.vw_binary, ' '.join(opts), self.dummy_input_fpath)
-        self.log.debug('cmd = %s' % cmd)
+        cmd = '%s %s %s' % (self.vw_binary, ' '.join(opts), self.dummy_input_fpath)
+        self.log.debug('vowpal wabbit command', command=cmd)
 
         # launch command
-        ret = subprocess.call(shlex.split(cmd))
+        self.vw_process = subprocess.Popen(shlex.split(cmd))
 
-        # wait for some time until pid file appears
-        if not sleep_until(lambda: os.path.exists(self.pid_fpath)):
-            raise Exception('Failed to execute vw process. Pid file not found.')
+        self.log = self.log.bind(pid=self.vw_process.pid)
+        self.log.debug('Started vw process')
+
+        # TODO: do we need to wait till the process is ready
+        # to accept a socket connection? If yes, how?
 
         # initilize socket for communication
-        # NOTE: Upon successful connection, we are finding the pid
-        # of the daemon process that is found to be listening on
-        # the correct port number. We are doing this and overwriting the pid
-        # written into pid file by VWWRAPPER because for some reason
-        # the pid is off by one!
-        self.sock = VWSocket(self, on_fatal_failure=self.on_fatal_failure,
-            on_connect=lambda: open(self.pid_fpath, 'w').write(str(get_vwdaemon_pid(self.port))))
+        self.sock = VWSocket(self, on_fatal_failure=self.on_fatal_failure)
 
     def load_options(self):
         if os.path.exists(self.options_fpath):
             return eval(open(self.options_fpath).read())
         else:
-            return dict(VWOPTIONS)
+            return dict(VW_DEFAULT_OPTIONS)
 
     def save_options(self):
         open(self.options_fpath, 'w').write(repr(self.options))
@@ -272,25 +251,24 @@ class VW(object):
         return self.sock.send_commands(items)
 
     def unload(self):
+        self.log.debug('Unloading vw model')
         self.sock.close()
-
-        pid = self.kill_vw_processes()
-        if not sleep_until(lambda: not is_process_running(pid)):
-            raise Exception('unable to kill vw process with pid %s' % pid)
+        self.kill_vw_process()
 
     def destroy(self):
+        self.log.debug('Destroying vw model')
         self.unload()
         shutil.rmtree(self.data_dir)
 
 @decorator
-def ensurevw(fn, vw, *args, **kwargs):
+def ensurevw(fn, self, vw, *args, **kwargs):
     data_dir = os.path.join(self.data_dir, vw)
 
     if vw not in self.vws and not VW.exists(vw, data_dir):
         raise Exception('vw "%s" does not exist' % vw)
 
     if vw not in self.vws:
-        self.vws[vw] = VW(vw, self.vw_binary, data_dir, log=self.log,
+        self.vws[vw] = VW(vw, data_dir, self.vw_binary, log=self.log,
             on_fatal_failure=lambda: self.unload(vw))
 
     return fn(self, self.vws[vw], *args, **kwargs)
@@ -302,28 +280,48 @@ class VWAPI(object):
         self.vws = {}
 
     def _check_options(self, options):
-        extra_options = set(options.iterkeys()) - set(VWOPTIONS.iterkeys())
-        if extra_options:
-            raise Exception('Unexpected options: %s' % ','.join(extra_options))
+        options = set(options.keys())
 
-    def show_options(self):
+        bad_options = options.intersection(VW_MUST_OPTIONS)
+        if bad_options:
+            raise Exception('Unexpected options: %s' % ','.join(bad_options))
+
+    def show_default_options(self):
         '''
         Shows the allowed options and their default values
         '''
-        return copy.deepcopy(VWOPTIONS)
+        return copy.deepcopy(dict(must=VW_MUST_OPTIONS, defaults=VW_DEFAULT_OPTIONS))
 
-    def create(self, name, options=None):
+    def _exists(self, name):
+        data_dir = os.path.join(self.data_dir, name)
+
+        if name in self.vws:
+            return (True, 'EXISTS_AND_LOADED')
+
+        if not VW.exists(name, data_dir):
+            return (False, 'DOES_NOT_EXIST')
+
+        else:
+            return (True, 'EXISTS_BUT_NOT_LOADED')
+
+    def exists(self, name):
+        state = self._exists(name)
+        return dict(zip(['exists', 'message'], state))
+
+    def create(self, name, options=None, load_if_present=True):
         '''
         Creates a new VW model with @name and using @options
         '''
-        options = options or VWOPTIONS
+        options = options or VW_DEFAULT_OPTIONS
         self._check_options(options)
         data_dir = os.path.join(self.data_dir, name)
 
-        if name in self.vws or VW.exists(name, data_dir):
+        if not load_if_present and (name in self.vws or VW.exists(name, data_dir)):
             raise Exception('vw model "%s" exists already' % name)
 
-        os.makedirs(data_dir)
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)
+
         self.vws[name] = VW(name, data_dir, self.vw_binary, self.log, options,
             on_fatal_failure=lambda: self.unload(name))
 
@@ -442,4 +440,4 @@ class VWServer(Server):
             help='Absolute path of vw executable file')
 
 if __name__ == '__main__':
-    VWServer()
+    VWServer().start()
